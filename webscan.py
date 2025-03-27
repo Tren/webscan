@@ -1,14 +1,16 @@
 import argparse
 import requests
 import threading
+import time
 from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor
 import random
 import traceback
 import urllib3
+from queue import Queue
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# 禁用SSL验证警告
+# 禁用SSL警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -33,7 +35,7 @@ class Scanner:
         ]
 
     def generate_backup_names(self, hostname):
-        """生成包含多种后缀的备份文件名"""
+        """流式生成备份文件名"""
         parts = hostname.split('.')
         names = set()
         base_names = []
@@ -64,7 +66,6 @@ class Scanner:
             status_code = response.status_code
             content_length = len(response.content)
 
-            # 输出带大小的结果
             with self.lock:
                 print(f"[{status_code}] {url} [Size: {content_length} bytes]", flush=True)
 
@@ -83,8 +84,65 @@ class Scanner:
                 print(f"[ERROR] {url} - {str(e)}", flush=True)
                 traceback.print_exc()
 
+def path_generator(dict_path, targets, bak_enabled):
+    """流式路径生成器"""
+    # 生成字典文件路径
+    try:
+        with open(dict_path, 'r') as f:
+            for line in f:
+                path = line.strip()
+                if path:
+                    yield path
+    except FileNotFoundError:
+        print(f"[!] 字典文件不存在: {dict_path}")
+        exit(1)
+
+    # 生成备份路径
+    if bak_enabled:
+        for target in targets:
+            parsed = urlparse(target)
+            host = parsed.hostname.split(':')[0] if parsed.hostname else parsed.netloc.split(':')[0]
+            scanner = Scanner(host)
+            for name in scanner.generate_backup_names(host):
+                yield name
+
+def producer(task_queue, dict_path, targets, bak_enabled, max_queued=1000):
+    """生产者线程"""
+    for target in targets:
+        # 标准化URL
+        if not target.startswith(('http://', 'https://')):
+            target = 'http://' + target
+        parsed = urlparse(target)
+        host = parsed.hostname.split(':')[0] if parsed.hostname else parsed.netloc.split(':')[0]
+        scanner = Scanner(host)
+        base_url = f"{parsed.scheme}://{host}/"
+
+        # 生成任务
+        for path in path_generator(dict_path, [target], bak_enabled):
+            # 队列控制
+            while task_queue.qsize() > max_queued:
+                time.sleep(0.1)
+            
+            full_url = urljoin(base_url, path.lstrip('/'))
+            task_queue.put( (scanner, full_url) )
+    
+    # 发送结束信号
+    task_queue.put(None)
+
+def consumer(task_queue, output_file):
+    """消费者线程"""
+    while True:
+        task = task_queue.get()
+        if task is None:
+            task_queue.put(None)  # 传递结束信号
+            break
+        
+        scanner, url = task
+        scanner.scan(url, USER_AGENTS, output_file)
+        task_queue.task_done()
+
 def main():
-    parser = argparse.ArgumentParser(description="多线程目录扫描器")
+    parser = argparse.ArgumentParser(description="内存优化的多线程目录扫描器")
     parser.add_argument('-u', '--url', help="单个目标URL")
     parser.add_argument('-f', '--file', help="目标文件")
     parser.add_argument('-d', '--dict', required=True, help="字典文件路径")
@@ -93,7 +151,7 @@ def main():
     parser.add_argument('-o', '--output', help="输出文件路径")
     args = parser.parse_args()
 
-    # 加载目标列表
+    # 加载目标
     targets = []
     if args.url:
         targets.append(args.url)
@@ -105,15 +163,17 @@ def main():
             print(f"[!] 目标文件不存在: {args.file}")
             exit(1)
 
-    # 目标格式标准化
+    # 过滤无效目标
     valid_targets = []
     for target in targets:
-        if not target.startswith(('http://', 'https://')):
-            target = 'http://' + target
         parsed = urlparse(target)
         if not parsed.netloc:
-            print(f"[!] 无效目标格式: {target}")
-            continue
+            if not target.startswith(('http://', 'https://')):
+                target = 'http://' + target
+                parsed = urlparse(target)
+            if not parsed.netloc:
+                print(f"[!] 无效目标格式: {target}")
+                continue
         valid_targets.append(target)
     targets = valid_targets
 
@@ -121,69 +181,30 @@ def main():
         print("[!] 错误：未指定有效扫描目标")
         exit(1)
 
-    # 初始化Scanner实例
-    scanners = {}
-    for target in targets:
-        parsed = urlparse(target)
-        host = parsed.hostname.split(':')[0] if parsed.hostname else parsed.netloc.split(':')[0]
-        host_key = host.replace("www.", "", 1)
-        if host_key not in scanners:
-            scanners[host_key] = Scanner(host_key)
+    # 创建任务队列
+    task_queue = Queue(maxsize=10)
 
-    # 加载字典路径
-    try:
-        with open(args.dict, 'r') as f:
-            original_paths = [line.strip() for line in f if line.strip()]
-    except Exception as e:
-        print(f"[!] 加载字典文件失败: {str(e)}")
-        exit(1)
+    # 启动生产者线程
+    producer_thread = threading.Thread(
+        target=producer,
+        args=(task_queue, args.dict, targets, args.bak)
+    )
+    producer_thread.start()
 
-    # 处理备份文件路径
-    backup_paths = []
-    if args.bak:
-        for target in targets:
-            parsed = urlparse(target)
-            host = parsed.hostname.split(':')[0] if parsed.hostname else parsed.netloc.split(':')[0]
-            host_key = host.replace("www.", "", 1)
-            scanner = scanners.get(host_key)
-            if not scanner:
-                continue
-            backup_paths.extend(scanner.generate_backup_names(host))
-
-    # 合并路径列表
-    paths = list(set(original_paths + backup_paths))
-    print(f"[*] 合并后有效路径数: {len(paths)}")
-
-    # 生成扫描任务
-    tasks = []
-    for target in targets:
-        parsed = urlparse(target)
-        host = parsed.hostname.split(':')[0] if parsed.hostname else parsed.netloc.split(':')[0]
-        host_key = host.replace("www.", "", 1)
-        scanner = scanners.get(host_key)
-        if not scanner:
-            continue
-
-        base_url = f"{parsed.scheme}://{host}/"
-        for path in paths:
-            clean_path = path.lstrip('/')
-            full_url = urljoin(base_url, clean_path)
-            tasks.append((scanner, full_url))
-
-    print(f"[*] 生成扫描任务总数: {len(tasks)}")
-    if not tasks:
-        print("[!] 错误：未生成任何扫描任务")
-        exit(1)
-
-    # 执行扫描任务
+    # 启动消费者线程池
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        print(f"[*] 启动线程池（线程数: {args.threads}）")
-        futures = []
-        for scanner, url in tasks:
-            futures.append(executor.submit(scanner.scan, url, USER_AGENTS, args.output))
+        # 提交消费者任务
+        futures = [executor.submit(consumer, task_queue, args.output) 
+                  for _ in range(args.threads)]
         
+        # 等待生产者完成
+        producer_thread.join()
+        task_queue.put(None)  # 结束信号
+        
+        # 等待所有任务完成
+        task_queue.join()
         for future in futures:
-            future.result()
+            future.cancel()
 
 if __name__ == '__main__':
     main()
